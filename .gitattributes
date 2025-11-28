@@ -1,2 +1,4 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+data/customer_support_data.csv filter=lfs diff=lfs merge=lfs -text
+src/data_preperation.py filter=lfs diff=lfs merge=lfs -text
