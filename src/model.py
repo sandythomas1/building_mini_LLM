@@ -26,5 +26,23 @@ class Head(nn.Module):
         self.register_buffer('tril', torch.tril(torch.ones(head_size, head_size)))
 
     def forward(self, x):
-        pass #just for now 
-        pass #to be implemented later
+        B, T, C = x.shape
+
+        #generate keys, queries, values
+        k = self.key(x)   # (B, T, head_size)
+        q = self.query(x) # (B, T, head_size)
+        v = self.value(x) # (B, T, head_size)
+
+        #compute attention scores
+        head_size = k.size(-1)
+        weights = q @ k.transpose(-2, -1) * head_size**-0.5 # (B, T, T)
+
+        #scaling factor
+        weights = weights.masked_fill(self.tril[:T, :T] == 0, float('-inf'))
+        weights = F.softmax(weights, dim=-1) # (B, T, T)
+
+        #aggregate the values
+        out = weights @ v # (B, T, head_size)
+
+        return out
+
