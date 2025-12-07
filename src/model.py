@@ -45,4 +45,43 @@ class Head(nn.Module):
         out = weights @ v # (B, T, head_size)
 
         return out
+    
+class MultiHeadAttention(nn.Module):
+    def __init__(self, n_head, n_embed):
+        super().__init__()
 
+        #calculate head size
+        head_size = n_embed // n_head
+
+        #create multiple heads
+
+        self.heads = nn.ModuleList([
+            Head(n_embed, head_size) for _ in range(n_head)
+        ])
+
+        #final projection layer
+        self.proj = nn.Linear(n_embed, n_embed)
+
+    def forward(self, x):
+        #concatenate outputs from all heads
+        out = torch.cat([head(x) for head in self.heads], dim=-1)
+        out = self.proj(out)
+        return out
+    
+#feed forward network
+class FeedForward(nn.Module):
+    def __init__(self, n_embd):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(n_embd, 4 * n_embd),
+            nn.ReLU(),
+            nn.Linear(4 * n_embd, n_embd),
+        )
+
+    def forward(self, x):
+        #pass #will implement later
+        return self.net(x)
+    
+class Block(nn.Module):
+    pass
+    
