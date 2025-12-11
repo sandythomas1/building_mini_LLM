@@ -1,5 +1,16 @@
 #building model architecture
 
+#imports
+import torch
+import torch.nn as nn
+from torch.nn import functional as F #matrix operations
+
+# Enable Tensor Core math
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+# Enable automatic fastest cuDNN kernel selection
+torch.backends.cudnn.benchmark = True
+
 class TransformerConfig:
     def __init__(self, vocab_size, block_size, n_layer, n_head, n_embd):
         self.vocab_size = vocab_size
@@ -7,11 +18,6 @@ class TransformerConfig:
         self.n_layer = n_layer
         self.n_head = n_head
         self.n_embd = n_embd
-
-#imports
-import torch
-import torch.nn as nn
-from torch.nn import functional as F #matrix operations
 
 class Head(nn.Module):
     def __init__(self, n_embd, head_size):
@@ -83,5 +89,40 @@ class FeedForward(nn.Module):
         return self.net(x)
     
 class Block(nn.Module):
-    pass
+    #transformer block
+    def __init__(self, n_embd, n_head):
+        super().__init__()
+        #multihead attention sublayer
+        self.sa = MultiHeadAttention(n_head, n_embd)
+        self.ffwd = FeedForward(n_embd)
+        self.ln1 = nn.LayerNorm(n_embd)
+        self.ln2 = nn.LayerNorm(n_embd)
     
+    def forward(self, x):
+        x = x + self.sa(self.ln1(x))
+        x = x + self.ffwd(self.ln2(x))
+        return x
+
+class Transformer(nn.Module):
+    def __init__(self, config: TransformerConfig):
+        super().__init__()
+        self.config = config
+
+        #token embedding table
+        self.token_embedding_table = nn.Embedding(config.vocab_size, config.n_embd)
+        #position embedding table
+        self.position_embedding_table = nn.Embedding(config.block_size, config.n_embd)
+
+        #transformer blocks
+        self.blocks = nn.Sequential(*[
+            Block(config.n_embd, config.n_head) for _ in range(config.n_layer)
+        ])
+
+        #layer norm
+        self.ln_f = nn.LayerNorm(config.n_embd)
+
+        #final linear layer
+        self.lm_head = nn.Linear(config.n_embd, config.vocab_size)
+    
+    def forward(self, idx, targets=None):
+        pass
