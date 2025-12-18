@@ -1,15 +1,10 @@
-#building model architecture
-
-#imports
 import torch
 import torch.nn as nn
-from torch.nn import functional as F #matrix operations
+from torch.nn import functional as F
 
-# Enable Tensor Core math
+# Enable performance optimizations for modern GPUs
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
-# Enable automatic fastest cuDNN kernel selection
-torch.backends.cudnn.benchmark = True
 
 class TransformerConfig:
     def __init__(self, vocab_size, block_size, n_layer, n_head, n_embd):
@@ -20,62 +15,45 @@ class TransformerConfig:
         self.n_embd = n_embd
 
 class Head(nn.Module):
+    """ One single head of self-attention """
     def __init__(self, n_embd, head_size):
         super().__init__()
-
-        #define Query, Key, Value
         self.key = nn.Linear(n_embd, head_size, bias=False)
         self.query = nn.Linear(n_embd, head_size, bias=False)
         self.value = nn.Linear(n_embd, head_size, bias=False)
-
-        #buffer for masking
-        self.register_buffer('tril', torch.tril(torch.ones(head_size, head_size)))
+        self.register_buffer('tril', torch.tril(torch.ones(1024, 1024))) # Large enough buffer
 
     def forward(self, x):
         B, T, C = x.shape
-
-        #generate keys, queries, values
         k = self.key(x)   # (B, T, head_size)
         q = self.query(x) # (B, T, head_size)
-        v = self.value(x) # (B, T, head_size)
-
-        #compute attention scores
+        
+        # Compute attention scores ("affinities")
         head_size = k.size(-1)
-        weights = q @ k.transpose(-2, -1) * head_size**-0.5 # (B, T, T)
-
-        #scaling factor
+        weights = q @ k.transpose(-2, -1) * head_size**-0.5
         weights = weights.masked_fill(self.tril[:T, :T] == 0, float('-inf'))
-        weights = F.softmax(weights, dim=-1) # (B, T, T)
-
-        #aggregate the values
-        out = weights @ v # (B, T, head_size)
-
+        weights = F.softmax(weights, dim=-1)
+        
+        # Weighted aggregation of values
+        v = self.value(x)
+        out = weights @ v 
         return out
-    
+
 class MultiHeadAttention(nn.Module):
-    def __init__(self, n_head, n_embed):
+    """ Multiple heads of self-attention run in parallel """
+    def __init__(self, n_head, n_embd):
         super().__init__()
-
-        #calculate head size
-        head_size = n_embed // n_head
-
-        #create multiple heads
-
-        self.heads = nn.ModuleList([
-            Head(n_embed, head_size) for _ in range(n_head)
-        ])
-
-        #final projection layer
-        self.proj = nn.Linear(n_embed, n_embed)
+        head_size = n_embd // n_head
+        self.heads = nn.ModuleList([Head(n_embd, head_size) for _ in range(n_head)])
+        self.proj = nn.Linear(n_embd, n_embd)
 
     def forward(self, x):
-        #concatenate outputs from all heads
-        out = torch.cat([head(x) for head in self.heads], dim=-1)
+        out = torch.cat([h(x) for h in self.heads], dim=-1)
         out = self.proj(out)
         return out
-    
-#feed forward network
+
 class FeedForward(nn.Module):
+    """ Simple linear layer followed by non-linearity """
     def __init__(self, n_embd):
         super().__init__()
         self.net = nn.Sequential(
@@ -85,19 +63,17 @@ class FeedForward(nn.Module):
         )
 
     def forward(self, x):
-        #pass #will implement later
         return self.net(x)
-    
+
 class Block(nn.Module):
-    #transformer block
+    """ Transformer block: communication followed by computation """
     def __init__(self, n_embd, n_head):
         super().__init__()
-        #multihead attention sublayer
         self.sa = MultiHeadAttention(n_head, n_embd)
         self.ffwd = FeedForward(n_embd)
         self.ln1 = nn.LayerNorm(n_embd)
         self.ln2 = nn.LayerNorm(n_embd)
-    
+
     def forward(self, x):
         x = x + self.sa(self.ln1(x))
         x = x + self.ffwd(self.ln2(x))
@@ -108,21 +84,38 @@ class Transformer(nn.Module):
         super().__init__()
         self.config = config
 
-        #token embedding table
         self.token_embedding_table = nn.Embedding(config.vocab_size, config.n_embd)
-        #position embedding table
         self.position_embedding_table = nn.Embedding(config.block_size, config.n_embd)
-
-        #transformer blocks
-        self.blocks = nn.Sequential(*[
-            Block(config.n_embd, config.n_head) for _ in range(config.n_layer)
-        ])
-
-        #layer norm
+        self.blocks = nn.Sequential(*[Block(config.n_embd, config.n_head) for _ in range(config.n_layer)])
         self.ln_f = nn.LayerNorm(config.n_embd)
-
-        #final linear layer
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size)
-    
+
     def forward(self, idx, targets=None):
-        pass
+        B, T = idx.shape
+        tok_emb = self.token_embedding_table(idx) 
+        pos_emb = self.position_embedding_table(torch.arange(T, device=idx.device)) 
+        x = tok_emb + pos_emb 
+        x = self.blocks(x)
+        x = self.ln_f(x)
+        logits = self.lm_head(x)
+
+        loss = None
+        if targets is not None:
+            B, T, C = logits.shape
+            logits = logits.view(B*T, C)
+            targets = targets.view(B*T)
+            loss = F.cross_entropy(logits, targets)
+
+        return logits, loss
+
+    @torch.no_grad()
+    def generate(self, idx, max_new_tokens):
+        for _ in range(max_new_tokens):
+            # Crop context to block_size
+            idx_cond = idx[:, -self.config.block_size:]
+            logits, _ = self(idx_cond)
+            logits = logits[:, -1, :] 
+            probs = F.softmax(logits, dim=-1)
+            idx_next = torch.multinomial(probs, num_samples=1)
+            idx = torch.cat((idx, idx_next), dim=1)
+        return idx
