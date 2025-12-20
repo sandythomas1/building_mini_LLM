@@ -1,11 +1,12 @@
 import torch
 from data_loader import Dataloader
 from model import Transformer, TransformerConfig
+import time
 
 # 1. Setup Hyperparameters
 config = TransformerConfig(
     vocab_size=50257,    # GPT-2 vocabulary size
-    block_size=128, 
+    block_size=128,   # context length
     n_layer=8, 
     n_head=8, 
     n_embd=512
@@ -14,6 +15,7 @@ config = TransformerConfig(
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 model = Transformer(config).to(device)
 optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size = 2000, gamma = 0.1)
 
 train_data_path = "/mnt/c/Users/sandy/Desktop/dev/building_mini_llm/data/training_data.bin" # Path to training data
 train_loader = Dataloader(train_data_path, batch_size=32, block_size=config.block_size)
@@ -34,6 +36,11 @@ def estimate_loss(model, loader, device, eval_iters=20):
 
 # 2. Example Training Loop
 def train(model, optimizer, loader, device, start_step=0, total_steps=10000):
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size = 2000, gamma = 0.1)
+
+    startTime = time.time()
+    print(f"Training started at {time.ctime(startTime)}")
+
     for i in range(start_step, total_steps):
         
         # Every 250 steps, check how we are doing on validation data
@@ -52,10 +59,22 @@ def train(model, optimizer, loader, device, start_step=0, total_steps=10000):
 
         # Standard training step
         xb, yb = loader.get_batch('train', device)
-        logits, loss = model(xb, yb)
+
         optimizer.zero_grad(set_to_none=True)
+        logits, loss = model(xb, yb)
+        #optimizer.zero_grad(set_to_none=True)
         loss.backward()
         optimizer.step()
+        scheduler.step()
+    
+    endTime = time.time()
+    totalDuration = endTime - startTime
+
+    print("Training complete")
+    if totalDuration < 3600:
+        print(f"Total time: {totalDuration / 60:.2f} minutes")
+    else:
+        print(f"Total time: {totalDuration / 3600:.2f} hours")
 
 if __name__ == "__main__":
     train(model, optimizer, train_loader, device)
