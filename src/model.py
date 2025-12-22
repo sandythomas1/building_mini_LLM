@@ -47,9 +47,13 @@ class MultiHeadAttention(nn.Module):
         self.heads = nn.ModuleList([Head(n_embd, head_size) for _ in range(n_head)])
         self.proj = nn.Linear(n_embd, n_embd)
 
+        #added: dropout current train & val loss(2.7654, 2.8116)
+        self.dropout = nn.Dropout(0.2)
+
     def forward(self, x):
         out = torch.cat([h(x) for h in self.heads], dim=-1)
         out = self.proj(out)
+        out = self.dropout(out)
         return out
 
 class FeedForward(nn.Module):
@@ -58,8 +62,9 @@ class FeedForward(nn.Module):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(n_embd, 4 * n_embd),
-            nn.ReLU(),
+            nn.GELU(),
             nn.Linear(4 * n_embd, n_embd),
+            nn.Dropout(0.2)  # added dropout
         )
 
     def forward(self, x):

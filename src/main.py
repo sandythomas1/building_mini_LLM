@@ -5,11 +5,11 @@ import time
 
 # 1. Setup Hyperparameters
 config = TransformerConfig(
-    vocab_size=50257,    # GPT-2 vocabulary size
-    block_size=128,   # context length
-    n_layer=8, 
-    n_head=8, 
-    n_embd=512
+    vocab_size= 65,     #50257,    # GPT-2 vocabulary size
+    block_size=256,   # context length
+    n_layer=12, 
+    n_head=12, 
+    n_embd=768
 )
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -18,7 +18,7 @@ optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
 scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size = 2000, gamma = 0.1)
 
 train_data_path = "/mnt/c/Users/sandy/Desktop/dev/building_mini_llm/data/training_data.bin" # Path to training data
-train_loader = Dataloader(train_data_path, batch_size=32, block_size=config.block_size)
+train_loader = Dataloader(train_data_path, batch_size=64, block_size=config.block_size)
 
 @torch.no_grad()
 def estimate_loss(model, loader, device, eval_iters=20):
