@@ -5,10 +5,10 @@ import time
 
 # 1. Setup Hyperparameters
 config = TransformerConfig(
-    vocab_size= 65,     #50257,    # GPT-2 vocabulary size
-    block_size=256,   # context length
-    n_layer=12, 
-    n_head=12, 
+    vocab_size=50257,     #50257,    # GPT-2 vocabulary size
+    block_size=128,   # context length
+    n_layer=8, 
+    n_head=8, 
     n_embd=768
 )
 
@@ -18,7 +18,7 @@ optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
 scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size = 2000, gamma = 0.1)
 
 train_data_path = "/mnt/c/Users/sandy/Desktop/dev/building_mini_llm/data/training_data.bin" # Path to training data
-train_loader = Dataloader(train_data_path, batch_size=64, block_size=config.block_size)
+train_loader = Dataloader(train_data_path, batch_size=16, block_size=config.block_size)
 
 @torch.no_grad()
 def estimate_loss(model, loader, device, eval_iters=20):
@@ -35,7 +35,7 @@ def estimate_loss(model, loader, device, eval_iters=20):
     return out
 
 # 2. Example Training Loop
-def train(model, optimizer, loader, device, start_step=0, total_steps=10000):
+def train(model, optimizer, loader, device, start_step=0, total_steps=12500):
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size = 2000, gamma = 0.1)
 
     startTime = time.time()
