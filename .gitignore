@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Generated datasets and training runs are large; regenerate them with src/prepare_data.py / src/train.py.
+data/*/train.bin
+data/*/val.bin
+out/
+*.pt.tmp
+*.bin.tmp

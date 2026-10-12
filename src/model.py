@@ -1,126 +1,197 @@
+"""GPT-style decoder-only transformer.
+
+Architecture follows GPT-2 (pre-norm blocks, learned positional embeddings,
+GELU MLP) with the efficiency fixes that matter on a single consumer GPU:
+fused QKV projection, PyTorch's flash/memory-efficient attention kernel,
+tied input/output embeddings, and a vocab padded to a multiple of 64.
+"""
+
+from __future__ import annotations
+
+import inspect
+import math
+from dataclasses import dataclass
+
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
-# Enable performance optimizations for modern GPUs
-torch.backends.cuda.matmul.allow_tf32 = True
-torch.backends.cudnn.allow_tf32 = True
+GPT2_VOCAB_SIZE = 50257
+PADDED_VOCAB_SIZE = 50304  # next multiple of 64 above 50257 -> faster tensor-core matmuls
 
-class TransformerConfig:
-    def __init__(self, vocab_size, block_size, n_layer, n_head, n_embd):
-        self.vocab_size = vocab_size
-        self.block_size = block_size
-        self.n_layer = n_layer
-        self.n_head = n_head
-        self.n_embd = n_embd
 
-class Head(nn.Module):
-    """ One single head of self-attention """
-    def __init__(self, n_embd, head_size):
+@dataclass
+class GPTConfig:
+    vocab_size: int = PADDED_VOCAB_SIZE
+    block_size: int = 512
+    n_layer: int = 8
+    n_head: int = 8
+    n_embd: int = 512
+    dropout: float = 0.0
+    bias: bool = False
+
+    def __post_init__(self) -> None:
+        if self.n_embd % self.n_head != 0:
+            raise ValueError(f"n_embd ({self.n_embd}) must be divisible by n_head ({self.n_head})")
+
+
+# Head size is 64 in every preset, which is the sweet spot for flash attention kernels.
+MODEL_PRESETS: dict[str, dict[str, int]] = {
+    "tiny": dict(n_layer=6, n_head=6, n_embd=384),  # ~30M params: fast experiments
+    "small": dict(n_layer=8, n_head=8, n_embd=512),  # ~51M params: default for an 8 GB card
+    "medium": dict(n_layer=12, n_head=12, n_embd=768),  # ~124M params: GPT-2 small
+}
+
+
+class CausalSelfAttention(nn.Module):
+    def __init__(self, config: GPTConfig):
         super().__init__()
-        self.key = nn.Linear(n_embd, head_size, bias=False)
-        self.query = nn.Linear(n_embd, head_size, bias=False)
-        self.value = nn.Linear(n_embd, head_size, bias=False)
-        self.register_buffer('tril', torch.tril(torch.ones(1024, 1024))) # Large enough buffer
+        self.n_head = config.n_head
+        self.dropout = config.dropout
+        self.qkv = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
+        self.proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
+        self.proj.is_residual_projection = True
+        self.resid_dropout = nn.Dropout(config.dropout)
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, T, C = x.shape
-        k = self.key(x)   # (B, T, head_size)
-        q = self.query(x) # (B, T, head_size)
-        
-        # Compute attention scores ("affinities")
-        head_size = k.size(-1)
-        weights = q @ k.transpose(-2, -1) * head_size**-0.5
-        weights = weights.masked_fill(self.tril[:T, :T] == 0, float('-inf'))
-        weights = F.softmax(weights, dim=-1)
-        
-        # Weighted aggregation of values
-        v = self.value(x)
-        out = weights @ v 
-        return out
-
-class MultiHeadAttention(nn.Module):
-    """ Multiple heads of self-attention run in parallel """
-    def __init__(self, n_head, n_embd):
-        super().__init__()
-        head_size = n_embd // n_head
-        self.heads = nn.ModuleList([Head(n_embd, head_size) for _ in range(n_head)])
-        self.proj = nn.Linear(n_embd, n_embd)
-
-        #added: dropout current train & val loss(2.7654, 2.8116)
-        self.dropout = nn.Dropout(0.2)
-
-    def forward(self, x):
-        out = torch.cat([h(x) for h in self.heads], dim=-1)
-        out = self.proj(out)
-        out = self.dropout(out)
-        return out
-
-class FeedForward(nn.Module):
-    """ Simple linear layer followed by non-linearity """
-    def __init__(self, n_embd):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(n_embd, 4 * n_embd),
-            nn.GELU(),
-            nn.Linear(4 * n_embd, n_embd),
-            nn.Dropout(0.2)  # added dropout
+        q, k, v = self.qkv(x).split(C, dim=2)
+        # (B, T, C) -> (B, n_head, T, head_size)
+        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
+        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
+        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
+        y = F.scaled_dot_product_attention(
+            q, k, v, is_causal=True, dropout_p=self.dropout if self.training else 0.0
         )
+        y = y.transpose(1, 2).contiguous().view(B, T, C)
+        return self.resid_dropout(self.proj(y))
 
-    def forward(self, x):
-        return self.net(x)
+
+class MLP(nn.Module):
+    def __init__(self, config: GPTConfig):
+        super().__init__()
+        self.fc = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
+        self.proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
+        self.proj.is_residual_projection = True
+        self.dropout = nn.Dropout(config.dropout)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.dropout(self.proj(F.gelu(self.fc(x))))
+
 
 class Block(nn.Module):
-    """ Transformer block: communication followed by computation """
-    def __init__(self, n_embd, n_head):
-        super().__init__()
-        self.sa = MultiHeadAttention(n_head, n_embd)
-        self.ffwd = FeedForward(n_embd)
-        self.ln1 = nn.LayerNorm(n_embd)
-        self.ln2 = nn.LayerNorm(n_embd)
+    """Pre-norm transformer block: attention then MLP, each with a residual connection."""
 
-    def forward(self, x):
-        x = x + self.sa(self.ln1(x))
-        x = x + self.ffwd(self.ln2(x))
+    def __init__(self, config: GPTConfig):
+        super().__init__()
+        self.ln1 = nn.LayerNorm(config.n_embd, bias=config.bias)
+        self.attn = CausalSelfAttention(config)
+        self.ln2 = nn.LayerNorm(config.n_embd, bias=config.bias)
+        self.mlp = MLP(config)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x + self.attn(self.ln1(x))
+        x = x + self.mlp(self.ln2(x))
         return x
 
-class Transformer(nn.Module):
-    def __init__(self, config: TransformerConfig):
+
+class GPT(nn.Module):
+    def __init__(self, config: GPTConfig):
         super().__init__()
         self.config = config
+        self.token_embedding = nn.Embedding(config.vocab_size, config.n_embd)
+        self.position_embedding = nn.Embedding(config.block_size, config.n_embd)
+        self.dropout = nn.Dropout(config.dropout)
+        self.blocks = nn.ModuleList([Block(config) for _ in range(config.n_layer)])
+        self.ln_f = nn.LayerNorm(config.n_embd, bias=config.bias)
+        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        # Weight tying: the output projection reuses the token embedding matrix.
+        # Saves vocab_size * n_embd params (~26M for the small preset) and regularizes.
+        self.lm_head.weight = self.token_embedding.weight
 
-        self.token_embedding_table = nn.Embedding(config.vocab_size, config.n_embd)
-        self.position_embedding_table = nn.Embedding(config.block_size, config.n_embd)
-        self.blocks = nn.Sequential(*[Block(config.n_embd, config.n_head) for _ in range(config.n_layer)])
-        self.ln_f = nn.LayerNorm(config.n_embd)
-        self.lm_head = nn.Linear(config.n_embd, config.vocab_size)
+        self.apply(self._init_weights)
 
-    def forward(self, idx, targets=None):
-        B, T = idx.shape
-        tok_emb = self.token_embedding_table(idx) 
-        pos_emb = self.position_embedding_table(torch.arange(T, device=idx.device)) 
-        x = tok_emb + pos_emb 
-        x = self.blocks(x)
+    def _init_weights(self, module: nn.Module) -> None:
+        if isinstance(module, nn.Linear):
+            std = 0.02
+            if getattr(module, "is_residual_projection", False):
+                # GPT-2 scaling: keeps the residual stream's variance from growing with depth.
+                std *= (2 * self.config.n_layer) ** -0.5
+            nn.init.normal_(module.weight, mean=0.0, std=std)
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            nn.init.normal_(module.weight, mean=0.0, std=0.02)
+
+    def num_params(self, non_embedding: bool = True) -> int:
+        n = sum(p.numel() for p in self.parameters())
+        if non_embedding:
+            n -= self.position_embedding.weight.numel()
+            n -= self.token_embedding.weight.numel()
+        return n
+
+    def forward(
+        self, idx: torch.Tensor, targets: torch.Tensor | None = None
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        _, T = idx.shape
+        if T > self.config.block_size:
+            raise ValueError(f"Sequence length {T} exceeds block_size {self.config.block_size}")
+
+        pos = torch.arange(T, device=idx.device)
+        x = self.dropout(self.token_embedding(idx) + self.position_embedding(pos))
+        for block in self.blocks:
+            x = block(x)
         x = self.ln_f(x)
+
+        if targets is None:
+            # Inference only needs the next-token distribution; skip the full (B, T, V) matmul.
+            return self.lm_head(x[:, [-1], :]), None
+
         logits = self.lm_head(x)
-
-        loss = None
-        if targets is not None:
-            B, T, C = logits.shape
-            logits = logits.view(B*T, C)
-            targets = targets.view(B*T)
-            loss = F.cross_entropy(logits, targets)
-
+        loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.reshape(-1))
         return logits, loss
 
+    def configure_optimizer(
+        self, weight_decay: float, learning_rate: float, betas: tuple[float, float], device_type: str
+    ) -> torch.optim.AdamW:
+        """AdamW with decay on matrices only; norms, biases and embeddings' 1-D params are exempt."""
+        params = [p for p in self.parameters() if p.requires_grad]
+        decay = [p for p in params if p.dim() >= 2]
+        no_decay = [p for p in params if p.dim() < 2]
+        groups = [
+            {"params": decay, "weight_decay": weight_decay},
+            {"params": no_decay, "weight_decay": 0.0},
+        ]
+        use_fused = device_type == "cuda" and "fused" in inspect.signature(torch.optim.AdamW).parameters
+        extra = {"fused": True} if use_fused else {}
+        return torch.optim.AdamW(groups, lr=learning_rate, betas=betas, **extra)
+
     @torch.no_grad()
-    def generate(self, idx, max_new_tokens):
+    def generate(
+        self,
+        idx: torch.Tensor,
+        max_new_tokens: int,
+        temperature: float = 1.0,
+        top_k: int | None = None,
+        stop_token: int | None = None,
+    ) -> torch.Tensor:
+        """Autoregressively extend `idx` (B, T). Stops early when every row emits `stop_token`."""
+        if temperature <= 0:
+            raise ValueError("temperature must be > 0")
+        finished = torch.zeros(idx.size(0), dtype=torch.bool, device=idx.device)
         for _ in range(max_new_tokens):
-            # Crop context to block_size
-            idx_cond = idx[:, -self.config.block_size:]
+            idx_cond = idx[:, -self.config.block_size :]
             logits, _ = self(idx_cond)
-            logits = logits[:, -1, :] 
-            probs = F.softmax(logits, dim=-1)
-            idx_next = torch.multinomial(probs, num_samples=1)
-            idx = torch.cat((idx, idx_next), dim=1)
+            logits = logits[:, -1, :] / temperature
+            # Never sample the padding slots added past the real GPT-2 vocab.
+            logits[:, GPT2_VOCAB_SIZE:] = -math.inf
+            if top_k is not None:
+                kth_largest = torch.topk(logits, min(top_k, logits.size(-1))).values[:, [-1]]
+                logits[logits < kth_largest] = -math.inf
+            next_token = torch.multinomial(F.softmax(logits, dim=-1), num_samples=1)
+            idx = torch.cat((idx, next_token), dim=1)
+            if stop_token is not None:
+                finished |= next_token.squeeze(1) == stop_token
+                if finished.all():
+                    break
         return idx

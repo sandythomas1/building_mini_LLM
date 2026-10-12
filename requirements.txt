@@ -1,0 +1,6 @@
+# PyTorch itself is installed separately: RTX 50-series (Blackwell, sm_120) needs a CUDA 12.8+ build, e.g.
+#   pip install torch --index-url https://download.pytorch.org/whl/cu128
+numpy>=2.0
+tiktoken>=0.7
+datasets>=3.0
+pytest>=8
