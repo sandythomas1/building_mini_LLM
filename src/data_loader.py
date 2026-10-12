@@ -1,30 +1,65 @@
-import torch 
-import numpy as np 
-import os
-device = 'cuda' if torch.cuda.is_available() else 'cpu'
+"""Random-window batch sampler over a flat uint16 token file (nanoGPT-style)."""
 
-class Dataloader:
-    def __init__(self, data_path, batch_size, block_size, split_ratio=0.9):
+from __future__ import annotations
+
+from pathlib import Path
+
+import numpy as np
+import torch
+
+TOKEN_DTYPE = np.uint16
+
+
+class TokenBatchLoader:
+    """Samples (x, y) batches of `block_size` windows where y is x shifted by one token.
+
+    Expects `<data_dir>/train.bin` and `<data_dir>/val.bin` written by prepare_data.py.
+    """
+
+    def __init__(
+        self,
+        data_dir: str | Path,
+        batch_size: int,
+        block_size: int,
+        device: str | torch.device,
+        seed: int = 1337,
+    ):
+        self.data_dir = Path(data_dir)
         self.batch_size = batch_size
         self.block_size = block_size
-        
-        # Load the binary data
-        data = np.memmap(data_path, dtype=np.uint16, mode='r')
-        
-        # Split into train and validation sets
-        n = int(split_ratio * len(data))
-        self.train_data = data[:n]
-        self.val_data = data[n:]
-        
-    def get_batch(self, split, device):
-        # Select the correct data set
-        data = self.train_data if split == 'train' else self.val_data
-        
-        # Generate random starting indices
-        ix = torch.randint(len(data) - self.block_size, (self.batch_size,))
-        
-        # Pull chunks
-        x = torch.stack([torch.from_numpy((data[i:i+self.block_size]).astype(np.int64)) for i in ix])
-        y = torch.stack([torch.from_numpy((data[i+1:i+self.block_size+1]).astype(np.int64)) for i in ix])
-        
-        return x.to(device), y.to(device)
+        self.device = torch.device(device)
+        self._rng = np.random.default_rng(seed)
+        self._offsets = np.arange(block_size + 1)
+        for split in ("train", "val"):
+            n = self.num_tokens(split)
+            if n <= block_size + 1:
+                raise ValueError(
+                    f"{self._path(split)} has {n} tokens; need more than block_size + 1 ({block_size + 1})"
+                )
+
+    def _path(self, split: str) -> Path:
+        if split not in ("train", "val"):
+            raise ValueError(f"split must be 'train' or 'val', got {split!r}")
+        return self.data_dir / f"{split}.bin"
+
+    def _open(self, split: str) -> np.memmap:
+        # Re-opened per batch on purpose: a long-lived np.memmap keeps every page it has
+        # touched referenced, which slowly grows RSS on multi-GB files.
+        return np.memmap(self._path(split), dtype=TOKEN_DTYPE, mode="r")
+
+    def num_tokens(self, split: str) -> int:
+        return self._path(split).stat().st_size // np.dtype(TOKEN_DTYPE).itemsize
+
+    def get_batch(self, split: str) -> tuple[torch.Tensor, torch.Tensor]:
+        data = self._open(split)
+        starts = self._rng.integers(0, len(data) - self.block_size - 1, size=self.batch_size)
+        windows = data[starts[:, None] + self._offsets].astype(np.int64)  # (B, block_size + 1)
+        chunk = torch.from_numpy(windows)
+        x, y = chunk[:, :-1], chunk[:, 1:]
+        if self.device.type == "cuda":
+            # Pinned host memory lets the copy overlap with GPU compute.
+            return (
+                x.pin_memory().to(self.device, non_blocking=True),
+                y.pin_memory().to(self.device, non_blocking=True),
+            )
+        return x.contiguous().to(self.device), y.contiguous().to(self.device)
