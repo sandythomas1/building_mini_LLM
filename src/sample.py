@@ -21,7 +21,12 @@ from train import load_checkpoint
 
 def load_model(ckpt_path: str, device: torch.device) -> GPT:
     checkpoint = load_checkpoint(ckpt_path)
-    model = GPT(GPTConfig(**checkpoint["model_config"]))
+    config = GPTConfig(**checkpoint["model_config"])
+    if not config.causal:
+        raise ValueError(
+            "This is an encoder checkpoint; use encode.py for embeddings, or choose a causal GPT checkpoint"
+        )
+    model = GPT(config)
     model.load_state_dict(checkpoint["model"])
     return model.to(device).eval()
 
