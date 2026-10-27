@@ -50,3 +50,20 @@ def test_rejects_unknown_split(data_dir):
     loader = TokenBatchLoader(data_dir, 2, 8, "cpu")
     with pytest.raises(ValueError, match="split"):
         loader.get_batch("test")
+
+
+def test_loader_state_restores_next_batch(data_dir):
+    loader = TokenBatchLoader(data_dir, 4, 8, "cpu")
+    loader.get_batch("train")
+    state = loader.state_dict()
+    expected = loader.get_batch("train")[0]
+    loader.load_state_dict(state)
+    assert (loader.get_batch("train")[0] == expected).all()
+
+
+def test_exactly_one_window_is_valid(tmp_path):
+    for split in ("train", "val"):
+        write_split(tmp_path, split, range(9))
+    x, y = TokenBatchLoader(tmp_path, 2, 8, "cpu").get_batch("train")
+    assert x.tolist() == [list(range(8))] * 2
+    assert y.tolist() == [list(range(1, 9))] * 2
